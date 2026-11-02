@@ -1556,12 +1556,15 @@ if "comparison_result" in st.session_state and st.session_state.get("comparison_
             for index, code in enumerate(code_labels):
                 old_amount = rent_roll_field_total(old_roll, code)
                 new_amount = rent_roll_field_total(new_roll, code)
-                code_card_cols[index % len(code_card_cols)].metric(
+                code_card = code_card_cols[index % len(code_card_cols)]
+                code_card.metric(
                     code,
                     f"${old_amount:,.2f} → ${new_amount:,.2f}",
-                    delta=f"New − Old: ${new_amount - old_amount:,.2f}",
-                    delta_color="off",
                 )
+                if round(old_amount, 2) == round(new_amount, 2):
+                    code_card.caption(f"✅ Old Site {code} matches New Site {code}")
+                else:
+                    code_card.caption(f"⚠️ Old Site {code} does not match New Site {code}")
     tab_diff, tab_missing_new, tab_missing_old = st.tabs(["Mismatched records", "Missing from new", "Missing from Old Site Report"])
     with tab_diff:
         displayed_differences = result_display_rows(result, result_type)
