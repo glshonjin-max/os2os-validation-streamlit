@@ -605,6 +605,7 @@ def compare_frames(
         key_labels.append(right_label or left_label or f"Key {n + 1}")
 
     differences: list[dict[str, Any]] = []
+    field_mismatch_counts: dict[str, int] = defaultdict(int)
     for old_i, new_i in matched:
         old_row, new_row = old.iloc[old_i], new.iloc[new_i]
         key_values = {key_labels[n]: display_value(old_row.iloc[a] if a < len(old_row) else None) for n, (a, _) in enumerate(key_pairs)}
@@ -619,6 +620,7 @@ def compare_frames(
             mismatch_row[f"New {label}"] = display_value(new_val)
             if not values_match(old_val, new_val, code_map, is_code_field(label), "net balance" in label.casefold()):
                 has_mismatch = True
+                field_mismatch_counts[label] += 1
         if has_mismatch:
             differences.append(mismatch_row)
 
@@ -642,6 +644,7 @@ def compare_frames(
         "missing_old": missing_old,
         "missing_new": missing_new,
         "differences": differences,
+        "field_mismatch_counts": dict(field_mismatch_counts),
         "key_labels": key_labels,
         "old_headers": old_headers,
         "new_headers": new_headers,
@@ -1362,6 +1365,30 @@ if "comparison_result" in st.session_state and st.session_state.get("comparison_
     c2.metric("Mismatched records", f"{len(result['differences']):,}")
     c3.metric("Missing from new", f"{len(result['missing_old']):,}")
     c4.metric("Missing from old", f"{len(result['missing_new']):,}")
+    if result["differences"]:
+        mismatch_count = len(result["differences"])
+        matched_count = len(result["matched"])
+        mismatch_share = mismatch_count / matched_count * 100 if matched_count else 0
+        top_fields = sorted(
+            result.get("field_mismatch_counts", {}).items(),
+            key=lambda item: (-item[1], item[0].casefold()),
+        )[:3]
+        st.markdown("#### Comparison insights")
+        with st.container(border=True):
+            st.markdown(
+                f"**{mismatch_count:,} of {matched_count:,} matched records ({mismatch_share:.1f}%)** "
+                "have at least one field mismatch."
+            )
+            if top_fields:
+                st.markdown("Most frequently mismatched fields:")
+                for field, count in top_fields:
+                    field_share = count / mismatch_count * 100
+                    st.markdown(f"- **{field}**: {count:,} records ({field_share:.1f}% of mismatched records)")
+            if result["missing_old"] or result["missing_new"]:
+                st.caption(
+                    f"Missing records: {len(result['missing_old']):,} from the New Site; "
+                    f"{len(result['missing_new']):,} from the Old Site."
+                )
     if result_type == "Market Rent Evaluation":
         old_market = result["market_rent_old"]
         new_market = result["market_rent_new"]
