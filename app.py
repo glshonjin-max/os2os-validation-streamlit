@@ -22,7 +22,7 @@ REPORTS = {
     "All units": {"keys": ["A", "I"], "validate": ["E", "G"]},
     "Delinquent and Prepaid": {"keys": ["C"], "validate": ["D", "G", "I", "N"]},
     "Rent Roll Report": {"keys": ["C", "H"], "validate": ["N", "S", "T"]},
-    "Resident Deposit": {"keys": ["A", "B"], "validate": ["F", "G", "H", "I", "J"]},
+    "Resident Deposit": {"keys": ["A", "B"], "validate": ["C", "F", "G", "H", "I", "J"]},
     "Market Rent Evaluation": {"keys": [], "validate": []},
     "Availability Report": {"keys": [], "validate": []},
     "Rentable and Assignable Items Report": {"keys": [], "validate": []},
@@ -296,6 +296,18 @@ def paired_display(record: dict[str, Any], field: str, money: bool = False) -> s
 
 def result_display_rows(result: dict[str, Any], report_type: str) -> list[dict[str, Any]]:
     records = result["differences"]
+    if report_type == "Resident Deposit":
+        display_fields = [
+            "Status", "Total Dep. Required", "Unit Deposit", "Pet Deposit",
+            "Other Deposits", "Deposits On Hand",
+        ]
+        return [
+            {"Name": record.get("Name", ""), **{
+                field: paired_display(record, field, money=field != "Status")
+                for field in display_fields
+            }}
+            for record in records
+        ]
     if report_type != "Delinquent and Prepaid":
         return records
     output = [
@@ -316,6 +328,14 @@ def result_display_rows(result: dict[str, Any], report_type: str) -> list[dict[s
         )
         output.append({"Bldg/Unit": "", "Name": "", "Status": "", "Code Description": "TOTALS", "Net Balance": total_text})
     return output
+
+
+def resident_deposit_display_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fields = [
+        "Name", "Status", "Total Dep. Required", "Unit Deposit", "Pet Deposit",
+        "Other Deposits", "Deposits On Hand",
+    ]
+    return [{field: record.get(field, "") for field in fields} for record in records]
 
 
 def add_net_balance_table_total(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -701,6 +721,20 @@ def market_field_total(frame: pd.DataFrame, field: str) -> float:
     return float(amounts.sum())
 
 
+def resident_deposit_total(frame: pd.DataFrame, headers: list[str], field: str) -> float:
+    name_index = find_header_index(headers, "Name")
+    amount_index = find_header_index(headers, field)
+    if name_index is None or amount_index is None:
+        return 0.0
+    names = frame.iloc[:, name_index]
+    has_resident = names.notna() & names.astype(str).str.strip().ne("")
+    amounts = pd.to_numeric(
+        frame.iloc[:, amount_index].astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False),
+        errors="coerce",
+    ).fillna(0)
+    return float(amounts[has_resident].sum())
+
+
 def add_market_rent_sheets(wb: Workbook, result: dict[str, Any]) -> None:
     unit_sheet = wb.create_sheet("Market Rent Units")
     unit_rows = market_rent_output_rows(result)
@@ -810,8 +844,13 @@ def make_report(result: dict[str, Any], report_type: str, task: str) -> bytes:
         summary.cell(row=total_row + 1, column=2).number_format = "#,##0.00"
 
     add_table("Differences", result_display_rows(result, report_type), "No value differences found.")
-    add_table("Missing from New", add_net_balance_table_total(result["missing_old_records"]), "No rows are missing from the New Site (Test Site Report).")
-    add_table("Missing from Old Site Report", add_net_balance_table_total(result["missing_new_records"]), "No rows are missing from the Old Site Report.")
+    missing_old_records = result["missing_old_records"]
+    missing_new_records = result["missing_new_records"]
+    if report_type == "Resident Deposit":
+        missing_old_records = resident_deposit_display_rows(missing_old_records)
+        missing_new_records = resident_deposit_display_rows(missing_new_records)
+    add_table("Missing from New", add_net_balance_table_total(missing_old_records), "No rows are missing from the New Site (Test Site Report).")
+    add_table("Missing from Old Site Report", add_net_balance_table_total(missing_new_records), "No rows are missing from the Old Site Report.")
     if report_type == "Market Rent Evaluation":
         add_market_rent_sheets(wb, result)
     style_sheet(summary, title=True)
@@ -861,7 +900,13 @@ def red_bold_table(records: list[dict[str, Any]]):
             return f"{value:,.2f}"
         return value
 
-    money_columns = {column: format_money for column in frame.columns if "net balance" in column.casefold()}
+    resident_deposit_money_fields = {
+        "total dep. required", "unit deposit", "pet deposit", "other deposits", "deposits on hand",
+    }
+    money_columns = {
+        column: format_money for column in frame.columns
+        if "net balance" in column.casefold() or column.casefold() in resident_deposit_money_fields
+    }
     def row_style(row):
         if row.get("Bldg/Unit") == "TOTALS" or row.get("Code Description") == "TOTALS":
             return ["color: #12334A; font-weight: bold; background-color: #F3F7FA"] * len(row)
@@ -1209,6 +1254,9 @@ elif old_upload and new_upload:
                 st.caption("Defaults are based on the report setup in your workbook. Adjust the paired columns if either export uses a different layout.")
                 st.markdown("**Match rows using**")
                 report_key = report_type.replace(" ", "_")
+                if report_type == "Resident Deposit":
+                    # New namespace drops previously saved field choices so Status uses its configured column.
+                    report_key += "_status_fields"
                 key_pairs = choose_indices(old_headers, new_headers, config["keys"], f"{report_key}_keys", "Match key")
                 st.markdown("**Compare values in**")
                 validation_pairs = choose_indices(old_headers, new_headers, config["validate"], f"{report_key}_validation", "Field")
@@ -1326,6 +1374,34 @@ if "comparison_result" in st.session_state and st.session_state.get("comparison_
         total_sqft_new.metric("New Site Total SQFT", f"{new_sqft:,.0f}")
         total_rent_old.metric("Old Site Total Base Rent", f"${old_base_rent:,.2f}")
         total_rent_new.metric("New Site Total Base Rent", f"${new_base_rent:,.2f}")
+    if result_type == "Resident Deposit":
+        old_rows, new_rows = result["old_rows"], result["new_rows"]
+        old_headers, new_headers = result["old_headers"], result["new_headers"]
+        old_required = resident_deposit_total(old_rows, old_headers, "Total Dep. Required")
+        new_required = resident_deposit_total(new_rows, new_headers, "Total Dep. Required")
+        old_on_hand = resident_deposit_total(old_rows, old_headers, "Deposits On Hand")
+        new_on_hand = resident_deposit_total(new_rows, new_headers, "Deposits On Hand")
+        old_unit_deposit = resident_deposit_total(old_rows, old_headers, "Unit Deposit")
+        new_unit_deposit = resident_deposit_total(new_rows, new_headers, "Unit Deposit")
+        old_pet_deposit = resident_deposit_total(old_rows, old_headers, "Pet Deposit")
+        new_pet_deposit = resident_deposit_total(new_rows, new_headers, "Pet Deposit")
+        old_other_deposits = resident_deposit_total(old_rows, old_headers, "Other Deposits")
+        new_other_deposits = resident_deposit_total(new_rows, new_headers, "Other Deposits")
+        required_old, required_new, on_hand_old, on_hand_new = st.columns(4)
+        required_old.metric("Old Site Total Dep. Required", f"${old_required:,.2f}")
+        required_new.metric("New Site Total Dep. Required", f"${new_required:,.2f}")
+        on_hand_old.metric("Old Site Deposits On Hand", f"${old_on_hand:,.2f}")
+        on_hand_new.metric("New Site Deposits On Hand", f"${new_on_hand:,.2f}")
+        st.markdown("**Deposit breakdown totals · Old Site**")
+        old_component_cards = st.columns(3)
+        old_component_cards[0].metric("Unit Deposit", f"${old_unit_deposit:,.2f}")
+        old_component_cards[1].metric("Pet Deposit", f"${old_pet_deposit:,.2f}")
+        old_component_cards[2].metric("Other Deposits", f"${old_other_deposits:,.2f}")
+        st.markdown("**Deposit breakdown totals · New Site**")
+        new_component_cards = st.columns(3)
+        new_component_cards[0].metric("Unit Deposit", f"${new_unit_deposit:,.2f}")
+        new_component_cards[1].metric("Pet Deposit", f"${new_pet_deposit:,.2f}")
+        new_component_cards[2].metric("Other Deposits", f"${new_other_deposits:,.2f}")
     if result_type == "Delinquent and Prepaid" and result.get("old_net_balance_total") is not None and result.get("new_net_balance_total") is not None:
         total_old_col, total_new_col = st.columns(2)
         total_old_col.metric("Old Site Net Balance Total", f"${money_display(result['old_net_balance_total'])}")
@@ -1341,14 +1417,20 @@ if "comparison_result" in st.session_state and st.session_state.get("comparison_
     with tab_missing_new:
         st.caption("Records from the Old Site Report not found in the New Site (Test Site Report).")
         if result["missing_old_records"]:
-            missing_new_view = red_bold_table(add_net_balance_table_total(result["missing_old_records"]))
+            missing_old_records = result["missing_old_records"]
+            if result_type == "Resident Deposit":
+                missing_old_records = resident_deposit_display_rows(missing_old_records)
+            missing_new_view = red_bold_table(add_net_balance_table_total(missing_old_records))
             st.dataframe(missing_new_view, use_container_width=True, hide_index=True)
         else:
             st.caption("Walang missing records.")
     with tab_missing_old:
         st.caption("Records from the New Site (Test Site Report) not found in the Old Site Report.")
         if result["missing_new_records"]:
-            missing_old_view = red_bold_table(add_net_balance_table_total(result["missing_new_records"]))
+            missing_new_records = result["missing_new_records"]
+            if result_type == "Resident Deposit":
+                missing_new_records = resident_deposit_display_rows(missing_new_records)
+            missing_old_view = red_bold_table(add_net_balance_table_total(missing_new_records))
             st.dataframe(missing_old_view, use_container_width=True, hide_index=True)
         else:
             st.caption("Walang missing records.")
