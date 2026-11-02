@@ -1578,7 +1578,8 @@ if "comparison_result" in st.session_state and st.session_state.get("comparison_
         st.markdown("**Billing totals by code**")
         code_labels = result.get("rent_roll_code_labels", [])
         if code_labels:
-            code_card_cols = st.columns(min(3, len(code_labels)))
+            # Give each Old → New currency pair enough width to remain readable.
+            code_card_cols = st.columns(min(2, len(code_labels)))
             for index, code in enumerate(code_labels):
                 old_amount = rent_roll_field_total(old_roll, code)
                 new_amount = rent_roll_field_total(new_roll, code)
