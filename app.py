@@ -21,8 +21,8 @@ from openpyxl.utils import get_column_letter
 REPORTS = {
     "All units": {"keys": ["A", "I"], "validate": ["E", "G"]},
     "Delinquent and Prepaid": {"keys": ["C"], "validate": ["D", "G", "I", "N"]},
-    "Rent Roll Report": {"keys": ["C", "H"], "validate": ["N", "S", "T"]},
-    "Resident Deposit": {"keys": ["A", "B"], "validate": ["F", "G", "H", "I", "J"]},
+    "Rent Roll Report": {"keys": [], "validate": []},
+    "Resident Deposit": {"keys": ["A", "B"], "validate": ["C", "F", "G", "H", "I", "J"]},
     "Market Rent Evaluation": {"keys": [], "validate": []},
     "Availability Report": {"keys": [], "validate": []},
     "Rentable and Assignable Items Report": {"keys": [], "validate": []},
@@ -139,6 +139,8 @@ def read_first_sheet(file_bytes: bytes, filename: str, report_type: str | None =
 MARKET_RENT_FIELDS = [
     "Unit Number", "Description/Amenities", "Unit SQFT", "Base Rent", "Amenity Value", "Market Rent",
 ]
+RENT_ROLL_MATCH_FIELDS = ["Unit", "Floorplan", "SQFT", "Unit/Lease Status", "Name"]
+RENT_ROLL_TOTAL_FIELD = "Total Billing"
 
 
 def extract_market_rent_data(raw: pd.DataFrame) -> pd.DataFrame:
@@ -194,6 +196,80 @@ def extract_market_rent_data(raw: pd.DataFrame) -> pd.DataFrame:
     if not records:
         raise ValueError("No unit-level Market Rent Evaluation records were found below the column headers.")
     return pd.DataFrame(records, columns=MARKET_RENT_FIELDS).reset_index(drop=True)
+
+
+def extract_rent_roll_data(raw: pd.DataFrame, code_map: dict[str, str] | None = None) -> pd.DataFrame:
+    """Extract comparable Rent Roll fields and standardize mapped billing code columns."""
+    normalize_header = lambda value: re.sub(r"[^a-z0-9]", "", str(value).casefold())
+    header_positions: dict[str, tuple[int, str]] = {}
+    header_row = None
+    required_headers = {normalize_header(field): field for field in [*RENT_ROLL_MATCH_FIELDS, "Lease Rent", RENT_ROLL_TOTAL_FIELD]}
+    for row_index in range(min(len(raw), 100)):
+        cells = [normalize_header(value) for value in raw.iloc[row_index].tolist()]
+        present = {header for header in required_headers if header in cells}
+        if all(normalize_header(field) in present for field in [*RENT_ROLL_MATCH_FIELDS, "Lease Rent", RENT_ROLL_TOTAL_FIELD]):
+            header_row = row_index
+            for col_index, value in enumerate(raw.iloc[row_index].tolist()):
+                normalized = normalize_header(value)
+                if normalized in required_headers:
+                    header_positions[required_headers[normalized]] = (col_index, str(value).strip())
+            break
+    if header_row is None:
+        raise ValueError("Could not find the required Rent Roll headers (Unit, Floorplan, SQFT, Unit/Lease Status, Name, Lease Rent, Total Billing).")
+
+    lease_rent_index = header_positions["Lease Rent"][0]
+    total_billing_index = header_positions[RENT_ROLL_TOTAL_FIELD][0]
+    code_columns = [
+        (col_index, str(raw.iat[header_row, col_index]).strip())
+        for col_index in range(lease_rent_index + 1, total_billing_index)
+        if not pd.isna(raw.iat[header_row, col_index]) and str(raw.iat[header_row, col_index]).strip()
+    ]
+    if not code_columns:
+        raise ValueError("No billing-code columns were found between Lease Rent and Total Billing in the Rent Roll report.")
+
+    new_code_labels: dict[str, str] = {}
+    for _, code in code_columns:
+        new_code_labels.setdefault(normalize(code), code)
+    mapping = {str(old).strip().casefold(): str(new).strip() for old, new in (code_map or {}).items()}
+    records: list[dict[str, Any]] = []
+    for _, source_row in raw.iloc[header_row + 1:].iterrows():
+        unit_value = source_row.iloc[header_positions["Unit"][0]]
+        if pd.isna(unit_value) or not str(unit_value).strip() or str(unit_value).strip().casefold().startswith(("total", "note:", "parameters:", "one site", "as of date:")):
+            continue
+        record = {
+            field: source_row.iloc[header_positions[field][0]]
+            for field in RENT_ROLL_MATCH_FIELDS
+        }
+        record["SQFT"] = pd.to_numeric(str(record["SQFT"]).replace(",", ""), errors="coerce")
+        record["Total Billing"] = pd.to_numeric(
+            str(source_row.iloc[total_billing_index]).replace(",", "").replace("$", ""), errors="coerce",
+        )
+        for col_index, source_code in code_columns:
+            mapped_code = mapping.get(source_code.casefold(), source_code)
+            canonical_code = new_code_labels.get(normalize(mapped_code), mapped_code)
+            amount = pd.to_numeric(
+                str(source_row.iloc[col_index]).replace(",", "").replace("$", ""), errors="coerce",
+            )
+            previous = record.get(canonical_code, 0.0)
+            record[canonical_code] = (0.0 if pd.isna(previous) else previous) + (0.0 if pd.isna(amount) else float(amount))
+        records.append(record)
+    if not records:
+        raise ValueError("No unit-level Rent Roll records were found below the column headers.")
+    return pd.DataFrame(records).reset_index(drop=True)
+
+
+def align_rent_roll_frames(old: pd.DataFrame, new: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    old_codes = [field for field in old.columns if field not in {*RENT_ROLL_MATCH_FIELDS, RENT_ROLL_TOTAL_FIELD}]
+    new_codes = [field for field in new.columns if field not in {*RENT_ROLL_MATCH_FIELDS, RENT_ROLL_TOTAL_FIELD}]
+    code_labels = list(dict.fromkeys([*new_codes, *old_codes]))
+    columns = [*RENT_ROLL_MATCH_FIELDS, *code_labels, RENT_ROLL_TOTAL_FIELD]
+    old_aligned, new_aligned = old.copy(), new.copy()
+    for code in code_labels:
+        if code not in old_aligned:
+            old_aligned[code] = 0.0
+        if code not in new_aligned:
+            new_aligned[code] = 0.0
+    return old_aligned.reindex(columns=columns), new_aligned.reindex(columns=columns), code_labels
 
 
 def guess_header_row(frame: pd.DataFrame, columns: list[str]) -> int:
@@ -296,6 +372,27 @@ def paired_display(record: dict[str, Any], field: str, money: bool = False) -> s
 
 def result_display_rows(result: dict[str, Any], report_type: str) -> list[dict[str, Any]]:
     records = result["differences"]
+    if report_type == "Rent Roll Report":
+        output = []
+        for record in records:
+            row = {field: record.get(field, "") for field in RENT_ROLL_MATCH_FIELDS}
+            for code in result.get("rent_roll_code_labels", []):
+                row[code] = paired_display(record, code, money=True)
+            row[RENT_ROLL_TOTAL_FIELD] = paired_display(record, RENT_ROLL_TOTAL_FIELD, money=True)
+            output.append(row)
+        return output
+    if report_type == "Resident Deposit":
+        display_fields = [
+            "Status", "Total Dep. Required", "Unit Deposit", "Pet Deposit",
+            "Other Deposits", "Deposits On Hand",
+        ]
+        return [
+            {"Name": record.get("Name", ""), **{
+                field: paired_display(record, field, money=field != "Status")
+                for field in display_fields
+            }}
+            for record in records
+        ]
     if report_type != "Delinquent and Prepaid":
         return records
     output = [
@@ -316,6 +413,14 @@ def result_display_rows(result: dict[str, Any], report_type: str) -> list[dict[s
         )
         output.append({"Bldg/Unit": "", "Name": "", "Status": "", "Code Description": "TOTALS", "Net Balance": total_text})
     return output
+
+
+def resident_deposit_display_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fields = [
+        "Name", "Status", "Total Dep. Required", "Unit Deposit", "Pet Deposit",
+        "Other Deposits", "Deposits On Hand",
+    ]
+    return [{field: record.get(field, "") for field in fields} for record in records]
 
 
 def add_net_balance_table_total(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -585,6 +690,7 @@ def compare_frames(
         key_labels.append(right_label or left_label or f"Key {n + 1}")
 
     differences: list[dict[str, Any]] = []
+    field_mismatch_counts: dict[str, int] = defaultdict(int)
     for old_i, new_i in matched:
         old_row, new_row = old.iloc[old_i], new.iloc[new_i]
         key_values = {key_labels[n]: display_value(old_row.iloc[a] if a < len(old_row) else None) for n, (a, _) in enumerate(key_pairs)}
@@ -599,6 +705,7 @@ def compare_frames(
             mismatch_row[f"New {label}"] = display_value(new_val)
             if not values_match(old_val, new_val, code_map, is_code_field(label), "net balance" in label.casefold()):
                 has_mismatch = True
+                field_mismatch_counts[label] += 1
         if has_mismatch:
             differences.append(mismatch_row)
 
@@ -622,6 +729,7 @@ def compare_frames(
         "missing_old": missing_old,
         "missing_new": missing_new,
         "differences": differences,
+        "field_mismatch_counts": dict(field_mismatch_counts),
         "key_labels": key_labels,
         "old_headers": old_headers,
         "new_headers": new_headers,
@@ -701,6 +809,26 @@ def market_field_total(frame: pd.DataFrame, field: str) -> float:
     return float(amounts.sum())
 
 
+def rent_roll_field_total(frame: pd.DataFrame, field: str) -> float:
+    if field not in frame:
+        return 0.0
+    return float(pd.to_numeric(frame[field], errors="coerce").fillna(0).sum())
+
+
+def resident_deposit_total(frame: pd.DataFrame, headers: list[str], field: str) -> float:
+    name_index = find_header_index(headers, "Name")
+    amount_index = find_header_index(headers, field)
+    if name_index is None or amount_index is None:
+        return 0.0
+    names = frame.iloc[:, name_index]
+    has_resident = names.notna() & names.astype(str).str.strip().ne("")
+    amounts = pd.to_numeric(
+        frame.iloc[:, amount_index].astype(str).str.replace(",", "", regex=False).str.replace("$", "", regex=False),
+        errors="coerce",
+    ).fillna(0)
+    return float(amounts[has_resident].sum())
+
+
 def add_market_rent_sheets(wb: Workbook, result: dict[str, Any]) -> None:
     unit_sheet = wb.create_sheet("Market Rent Units")
     unit_rows = market_rent_output_rows(result)
@@ -740,6 +868,30 @@ def add_market_rent_sheets(wb: Workbook, result: dict[str, Any]) -> None:
                 cell.font = Font(name="Aptos", size=10, bold=True, color=NAVY)
 
 
+def add_rent_roll_code_sheet(wb: Workbook, result: dict[str, Any]) -> None:
+    sheet = wb.create_sheet("Rent Roll Code Totals")
+    sheet.append(["Billing Code", "Old Site Total", "New Site Total", "Difference (New - Old)"])
+    old_frame: pd.DataFrame = result["rent_roll_old"]
+    new_frame: pd.DataFrame = result["rent_roll_new"]
+    old_total = new_total = 0.0
+    for code in result.get("rent_roll_code_labels", []):
+        old_amount = rent_roll_field_total(old_frame, code)
+        new_amount = rent_roll_field_total(new_frame, code)
+        old_total += old_amount
+        new_total += new_amount
+        sheet.append([code, old_amount, new_amount, new_amount - old_amount])
+    sheet.append(["TOTAL BILLING", old_total, new_total, new_total - old_total])
+    sheet.freeze_panes = "A2"
+    style_sheet(sheet)
+    for row_index in range(2, sheet.max_row + 1):
+        for column_index in range(2, 5):
+            sheet.cell(row_index, column_index).number_format = "#,##0.00"
+        if row_index == sheet.max_row:
+            for cell in sheet[row_index]:
+                cell.fill = PatternFill("solid", fgColor=PALE)
+                cell.font = Font(name="Aptos", size=10, bold=True, color=NAVY)
+
+
 def make_report(result: dict[str, Any], report_type: str, task: str) -> bytes:
     wb = Workbook()
     summary = wb.active
@@ -761,6 +913,10 @@ def make_report(result: dict[str, Any], report_type: str, task: str) -> bytes:
         for column_index in (2, 4):
             summary.cell(row=summary.max_row - 1, column=column_index).number_format = "#,##0"
             summary.cell(row=summary.max_row, column=column_index).number_format = "#,##0.00"
+    if report_type == "Rent Roll Report":
+        summary.append(["Old Site Total Billing", rent_roll_field_total(result["rent_roll_old"], RENT_ROLL_TOTAL_FIELD), "New Site Total Billing", rent_roll_field_total(result["rent_roll_new"], RENT_ROLL_TOTAL_FIELD)])
+        summary.cell(row=summary.max_row, column=2).number_format = "#,##0.00"
+        summary.cell(row=summary.max_row, column=4).number_format = "#,##0.00"
     summary.append([])
     summary.append(["Matching is based on the selected key columns. Only the first worksheet in each upload is read."])
     note_row = summary.max_row
@@ -810,10 +966,17 @@ def make_report(result: dict[str, Any], report_type: str, task: str) -> bytes:
         summary.cell(row=total_row + 1, column=2).number_format = "#,##0.00"
 
     add_table("Differences", result_display_rows(result, report_type), "No value differences found.")
-    add_table("Missing from New", add_net_balance_table_total(result["missing_old_records"]), "No rows are missing from the New Site (Test Site Report).")
-    add_table("Missing from Old Site Report", add_net_balance_table_total(result["missing_new_records"]), "No rows are missing from the Old Site Report.")
+    missing_old_records = result["missing_old_records"]
+    missing_new_records = result["missing_new_records"]
+    if report_type == "Resident Deposit":
+        missing_old_records = resident_deposit_display_rows(missing_old_records)
+        missing_new_records = resident_deposit_display_rows(missing_new_records)
+    add_table("Missing from New", add_net_balance_table_total(missing_old_records), "No rows are missing from the New Site (Test Site Report).")
+    add_table("Missing from Old Site Report", add_net_balance_table_total(missing_new_records), "No rows are missing from the Old Site Report.")
     if report_type == "Market Rent Evaluation":
         add_market_rent_sheets(wb, result)
+    if report_type == "Rent Roll Report":
+        add_rent_roll_code_sheet(wb, result)
     style_sheet(summary, title=True)
     summary.column_dimensions["A"].width = 29
     summary.column_dimensions["B"].width = 36
@@ -861,7 +1024,13 @@ def red_bold_table(records: list[dict[str, Any]]):
             return f"{value:,.2f}"
         return value
 
-    money_columns = {column: format_money for column in frame.columns if "net balance" in column.casefold()}
+    resident_deposit_money_fields = {
+        "total dep. required", "unit deposit", "pet deposit", "other deposits", "deposits on hand",
+    }
+    money_columns = {
+        column: format_money for column in frame.columns
+        if "net balance" in column.casefold() or column.casefold() in resident_deposit_money_fields
+    }
     def row_style(row):
         if row.get("Bldg/Unit") == "TOTALS" or row.get("Code Description") == "TOTALS":
             return ["color: #12334A; font-weight: bold; background-color: #F3F7FA"] * len(row)
@@ -1193,6 +1362,16 @@ elif old_upload and new_upload:
             validation_pairs = [(index, index) for index in range(1, len(MARKET_RENT_FIELDS))]
             st.markdown('<div class="step-label" style="margin-top:1rem">3 · Market rent fields</div>', unsafe_allow_html=True)
             st.caption("Units are matched by Bldg/Unit. Description/Amenities, square footage, base rent, amenity value, and market rent are included in the comparison and downloadable workbook.")
+        elif report_type == "Rent Roll Report":
+            old_header_row = new_header_row = 0
+            old_rows = extract_rent_roll_data(old_raw, custom_code_map)
+            new_rows = extract_rent_roll_data(new_raw)
+            old_rows, new_rows, rent_roll_code_labels = align_rent_roll_frames(old_rows, new_rows)
+            old_headers = new_headers = list(old_rows.columns)
+            key_pairs = [(index, index) for index in range(len(RENT_ROLL_MATCH_FIELDS))]
+            validation_pairs = [(index, index) for index in range(len(RENT_ROLL_MATCH_FIELDS), len(old_headers))]
+            st.markdown('<div class="step-label" style="margin-top:1rem">3 · Rent Roll fields</div>', unsafe_allow_html=True)
+            st.caption("Matching uses Unit, Floorplan, SQFT, Unit/Lease Status, and Name. Billing-code amounts and Total Billing are compared; the excluded columns are ignored. Old Site code mappings are applied before comparing code totals.")
         else:
             old_header_guess = guess_header_row(old_raw, config["keys"] + config["validate"])
             new_header_guess = guess_header_row(new_raw, config["keys"] + config["validate"])
@@ -1209,6 +1388,9 @@ elif old_upload and new_upload:
                 st.caption("Defaults are based on the report setup in your workbook. Adjust the paired columns if either export uses a different layout.")
                 st.markdown("**Match rows using**")
                 report_key = report_type.replace(" ", "_")
+                if report_type == "Resident Deposit":
+                    # New namespace drops previously saved field choices so Status uses its configured column.
+                    report_key += "_status_fields"
                 key_pairs = choose_indices(old_headers, new_headers, config["keys"], f"{report_key}_keys", "Match key")
                 st.markdown("**Compare values in**")
                 validation_pairs = choose_indices(old_headers, new_headers, config["validate"], f"{report_key}_validation", "Field")
@@ -1279,7 +1461,8 @@ elif old_upload and new_upload:
 
                 result = compare_frames(
                     compare_old, compare_new, compare_old_headers, compare_new_headers,
-                    compare_key_pairs, compare_validation_pairs, compare_code_map,
+                    compare_key_pairs, compare_validation_pairs,
+                    {} if report_type == "Rent Roll Report" else compare_code_map,
                 )
                 old_output_columns = list(dict.fromkeys([old_i for old_i, _ in compare_key_pairs + compare_validation_pairs]))
                 new_output_columns = list(dict.fromkeys([new_i for _, new_i in compare_key_pairs + compare_validation_pairs]))
@@ -1291,6 +1474,10 @@ elif old_upload and new_upload:
                 if report_type == "Market Rent Evaluation":
                     result["market_rent_old"] = old_rows
                     result["market_rent_new"] = new_rows
+                if report_type == "Rent Roll Report":
+                    result["rent_roll_old"] = old_rows
+                    result["rent_roll_new"] = new_rows
+                    result["rent_roll_code_labels"] = rent_roll_code_labels
                 st.session_state["comparison_result"] = result
                 st.session_state["comparison_meta"] = (report_type, task)
                 st.session_state["comparison_signature"] = comparison_signature
@@ -1314,6 +1501,30 @@ if "comparison_result" in st.session_state and st.session_state.get("comparison_
     c2.metric("Mismatched records", f"{len(result['differences']):,}")
     c3.metric("Missing from new", f"{len(result['missing_old']):,}")
     c4.metric("Missing from old", f"{len(result['missing_new']):,}")
+    if result["differences"]:
+        mismatch_count = len(result["differences"])
+        matched_count = len(result["matched"])
+        mismatch_share = mismatch_count / matched_count * 100 if matched_count else 0
+        top_fields = sorted(
+            result.get("field_mismatch_counts", {}).items(),
+            key=lambda item: (-item[1], item[0].casefold()),
+        )[:3]
+        st.markdown("#### Comparison insights")
+        with st.container(border=True):
+            st.markdown(
+                f"**{mismatch_count:,} of {matched_count:,} matched records ({mismatch_share:.1f}%)** "
+                "have at least one field mismatch."
+            )
+            if top_fields:
+                st.markdown("Most frequently mismatched fields:")
+                for field, count in top_fields:
+                    field_share = count / mismatch_count * 100
+                    st.markdown(f"- **{field}**: {count:,} records ({field_share:.1f}% of mismatched records)")
+            if result["missing_old"] or result["missing_new"]:
+                st.caption(
+                    f"Missing records: {len(result['missing_old']):,} from the New Site; "
+                    f"{len(result['missing_new']):,} from the Old Site."
+                )
     if result_type == "Market Rent Evaluation":
         old_market = result["market_rent_old"]
         new_market = result["market_rent_new"]
@@ -1326,10 +1537,57 @@ if "comparison_result" in st.session_state and st.session_state.get("comparison_
         total_sqft_new.metric("New Site Total SQFT", f"{new_sqft:,.0f}")
         total_rent_old.metric("Old Site Total Base Rent", f"${old_base_rent:,.2f}")
         total_rent_new.metric("New Site Total Base Rent", f"${new_base_rent:,.2f}")
+    if result_type == "Resident Deposit":
+        old_rows, new_rows = result["old_rows"], result["new_rows"]
+        old_headers, new_headers = result["old_headers"], result["new_headers"]
+        old_required = resident_deposit_total(old_rows, old_headers, "Total Dep. Required")
+        new_required = resident_deposit_total(new_rows, new_headers, "Total Dep. Required")
+        old_on_hand = resident_deposit_total(old_rows, old_headers, "Deposits On Hand")
+        new_on_hand = resident_deposit_total(new_rows, new_headers, "Deposits On Hand")
+        old_unit_deposit = resident_deposit_total(old_rows, old_headers, "Unit Deposit")
+        new_unit_deposit = resident_deposit_total(new_rows, new_headers, "Unit Deposit")
+        old_pet_deposit = resident_deposit_total(old_rows, old_headers, "Pet Deposit")
+        new_pet_deposit = resident_deposit_total(new_rows, new_headers, "Pet Deposit")
+        old_other_deposits = resident_deposit_total(old_rows, old_headers, "Other Deposits")
+        new_other_deposits = resident_deposit_total(new_rows, new_headers, "Other Deposits")
+        required_old, required_new, on_hand_old, on_hand_new = st.columns(4)
+        required_old.metric("Old Site Total Dep. Required", f"${old_required:,.2f}")
+        required_new.metric("New Site Total Dep. Required", f"${new_required:,.2f}")
+        on_hand_old.metric("Old Site Deposits On Hand", f"${old_on_hand:,.2f}")
+        on_hand_new.metric("New Site Deposits On Hand", f"${new_on_hand:,.2f}")
+        st.markdown("**Deposit breakdown totals · Old Site**")
+        old_component_cards = st.columns(3)
+        old_component_cards[0].metric("Unit Deposit", f"${old_unit_deposit:,.2f}")
+        old_component_cards[1].metric("Pet Deposit", f"${old_pet_deposit:,.2f}")
+        old_component_cards[2].metric("Other Deposits", f"${old_other_deposits:,.2f}")
+        st.markdown("**Deposit breakdown totals · New Site**")
+        new_component_cards = st.columns(3)
+        new_component_cards[0].metric("Unit Deposit", f"${new_unit_deposit:,.2f}")
+        new_component_cards[1].metric("Pet Deposit", f"${new_pet_deposit:,.2f}")
+        new_component_cards[2].metric("Other Deposits", f"${new_other_deposits:,.2f}")
     if result_type == "Delinquent and Prepaid" and result.get("old_net_balance_total") is not None and result.get("new_net_balance_total") is not None:
         total_old_col, total_new_col = st.columns(2)
         total_old_col.metric("Old Site Net Balance Total", f"${money_display(result['old_net_balance_total'])}")
         total_new_col.metric("New Site Net Balance Total", f"${money_display(result['new_net_balance_total'])}")
+    if result_type == "Rent Roll Report":
+        old_roll = result["rent_roll_old"]
+        new_roll = result["rent_roll_new"]
+        total_old, total_new = st.columns(2)
+        total_old.metric("Old Site Total Billing", f"${rent_roll_field_total(old_roll, RENT_ROLL_TOTAL_FIELD):,.2f}")
+        total_new.metric("New Site Total Billing", f"${rent_roll_field_total(new_roll, RENT_ROLL_TOTAL_FIELD):,.2f}")
+        st.markdown("**Billing totals by code**")
+        code_labels = result.get("rent_roll_code_labels", [])
+        if code_labels:
+            code_card_cols = st.columns(min(3, len(code_labels)))
+            for index, code in enumerate(code_labels):
+                old_amount = rent_roll_field_total(old_roll, code)
+                new_amount = rent_roll_field_total(new_roll, code)
+                code_card_cols[index % len(code_card_cols)].metric(
+                    code,
+                    f"${old_amount:,.2f} → ${new_amount:,.2f}",
+                    delta=f"New − Old: ${new_amount - old_amount:,.2f}",
+                    delta_color="off",
+                )
     tab_diff, tab_missing_new, tab_missing_old = st.tabs(["Mismatched records", "Missing from new", "Missing from Old Site Report"])
     with tab_diff:
         displayed_differences = result_display_rows(result, result_type)
@@ -1341,14 +1599,20 @@ if "comparison_result" in st.session_state and st.session_state.get("comparison_
     with tab_missing_new:
         st.caption("Records from the Old Site Report not found in the New Site (Test Site Report).")
         if result["missing_old_records"]:
-            missing_new_view = red_bold_table(add_net_balance_table_total(result["missing_old_records"]))
+            missing_old_records = result["missing_old_records"]
+            if result_type == "Resident Deposit":
+                missing_old_records = resident_deposit_display_rows(missing_old_records)
+            missing_new_view = red_bold_table(add_net_balance_table_total(missing_old_records))
             st.dataframe(missing_new_view, use_container_width=True, hide_index=True)
         else:
             st.caption("Walang missing records.")
     with tab_missing_old:
         st.caption("Records from the New Site (Test Site Report) not found in the Old Site Report.")
         if result["missing_new_records"]:
-            missing_old_view = red_bold_table(add_net_balance_table_total(result["missing_new_records"]))
+            missing_new_records = result["missing_new_records"]
+            if result_type == "Resident Deposit":
+                missing_new_records = resident_deposit_display_rows(missing_new_records)
+            missing_old_view = red_bold_table(add_net_balance_table_total(missing_new_records))
             st.dataframe(missing_old_view, use_container_width=True, hide_index=True)
         else:
             st.caption("Walang missing records.")
